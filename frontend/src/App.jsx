@@ -8,6 +8,8 @@ import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
 import ProcessesPage from './pages/ProcessesPage';
 import DatasetsPage from './pages/DatasetsPage';
+import StoragePage from './pages/StoragePage';
+import TerminalPage from './pages/TerminalPage';
 import Layout from './components/dashboard/Layout';
 
 const queryClient = new QueryClient({
@@ -53,6 +55,8 @@ export default function App() {
             <Route index element={<DashboardPage />} />
             <Route path="processes" element={<ProcessesPage />} />
             <Route path="datasets" element={<DatasetsPage />} />
+            <Route path="storage" element={<StoragePage />} />
+            <Route path="terminal" element={<TerminalPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

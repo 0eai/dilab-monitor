@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { motion, AnimatePresence } from 'framer-motion';
 import toast from 'react-hot-toast';
 import api from '../utils/api';
-import { useAuthStore } from '../stores/authStore';
+import { usePermissions } from '../hooks/usePermissions';
 import { formatMiB, truncateCmd, relativeTime } from '../utils/format';
 import { Cpu, Skull, Zap, AlertTriangle, Filter, Search, X, XCircle, Target } from 'lucide-react';
 
@@ -124,7 +124,7 @@ function ProcessRow({ proc, canKill, onKill }) {
 }
 
 export default function ProcessesPage() {
-  const { user } = useAuthStore();
+  const { can, isAdmin, username, user } = usePermissions();
   const queryClient = useQueryClient();
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('all'); // all | zombies | gpu | heavy
@@ -165,10 +165,7 @@ export default function ProcessesPage() {
   const zombieCount = data?.zombieCount || 0;
   const totalVram = data?.totalVramMiB || 0;
 
-  const canKillProcess = (proc) => {
-    if (user?.isAdmin) return true;
-    return proc.user === user?.username;
-  };
+  const canKillProcess = (proc) => can('kill:any') || can('kill:own', proc.user);
 
   const filtered = processes.filter(p => {
     if (nodeFilter !== 'all' && p.nodeId !== nodeFilter) return false;
@@ -200,7 +197,7 @@ export default function ProcessesPage() {
         </div>
 
         {/* Zombie batch kill */}
-        {user?.isAdmin && zombieCount > 0 && (
+        {can('kill:zombies-batch') && zombieCount > 0 && (
           <div className="flex gap-2">
             {['node1', 'node2'].map(nodeId => {
               const nodeZombies = processes.filter(p => p.nodeId === nodeId && p.isZombie);

@@ -108,4 +108,15 @@ export async function startMonitoringScheduler() {
   cron.schedule('*/5 * * * * *', pollAllNodes);
 
   console.log('[Scheduler] Monitoring scheduler started (5s interval)');
+
+  // Pre-warm storage cache in background (du is slow, do it early)
+  setTimeout(async () => {
+    console.log('[Scheduler] Pre-warming storage cache...');
+    const { fetchStorageByUser } = await import('./monitoringService.js');
+    await Promise.allSettled([
+      fetchStorageByUser('node1'),
+      fetchStorageByUser('node2')
+    ]);
+    console.log('[Scheduler] Storage cache warmed.');
+  }, 5000); // wait 5s for SSH to stabilise first
 }

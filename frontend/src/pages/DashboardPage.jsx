@@ -1,12 +1,14 @@
+import { useEffect } from 'react';
 import { useMetricsStore } from '../stores/metricsStore';
 import AlertBanner from '../components/monitoring/AlertBanner';
 import NodeCard from '../components/monitoring/NodeCard';
 import UserResourceTable from '../components/monitoring/UserResourceTable';
 import ThermalPanel from '../components/monitoring/ThermalPanel';
 import StoragePanel from '../components/monitoring/StoragePanel';
+import OpenPortsCard from '../components/monitoring/OpenPortsCard';
+import SSHSessionsCard from '../components/monitoring/SSHSessionsCard';
 import { Activity, RefreshCw } from 'lucide-react';
 import { relativeTime } from '../utils/format';
-import { useEffect } from 'react';
 
 export default function DashboardPage() {
   const { metrics, alerts, lastUpdated, isLoading, fetchMetrics, fetchHistory } = useMetricsStore();
@@ -33,11 +35,7 @@ export default function DashboardPage() {
           <span className="text-xs text-slate-600 font-mono">
             Updated {relativeTime(lastUpdated?.toISOString())}
           </span>
-          <button
-            onClick={fetchMetrics}
-            disabled={isLoading}
-            className="btn-ghost text-xs"
-          >
+          <button onClick={fetchMetrics} disabled={isLoading} className="btn-ghost text-xs">
             <RefreshCw size={12} className={isLoading ? 'animate-spin' : ''} />
             Refresh
           </button>
@@ -47,13 +45,13 @@ export default function DashboardPage() {
       {/* ── Alert Banner ── */}
       {alerts.length > 0 && <AlertBanner alerts={alerts} />}
 
-      {/* ── Node Cards (side by side) ── */}
+      {/* ── Node Overview Cards ── */}
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
         <NodeCard nodeId="node1" nodeData={metrics?.node1} />
         <NodeCard nodeId="node2" nodeData={metrics?.node2} />
       </div>
 
-      {/* ── Thermal Deep-Dive ── */}
+      {/* ── Thermal ── */}
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
         <ThermalPanel nodeId="node1" nodeData={metrics?.node1} />
         <ThermalPanel nodeId="node2" nodeData={metrics?.node2} isMissionCritical />
@@ -65,7 +63,13 @@ export default function DashboardPage() {
         <StoragePanel nodeId="node2" storage={metrics?.node2?.storage} />
       </div>
 
-      {/* ── Per-User Breakdown ── */}
+      {/* ── SSH Sessions + Open Ports (side by side) ── */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+        <SSHSessionsCard />
+        <OpenPortsCard />
+      </div>
+
+      {/* ── Per-User Resource Table ── */}
       <UserResourceTable
         node1Users={metrics?.node1?.users}
         node2Users={metrics?.node2?.users}

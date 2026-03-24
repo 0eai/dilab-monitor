@@ -44,7 +44,9 @@ export const useMetricsStore = create((set, get) => ({
     const { ws } = get();
     if (ws) ws.close();
 
-    const wsUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/metrics?token=${token}`;
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    // In dev: Vite proxies /ws/* correctly. In prod: Nginx proxies /ws/*.
+    const wsUrl = `${wsProtocol}://${window.location.host}/ws/metrics?token=${token}`;
     const socket = new WebSocket(wsUrl);
 
     socket.onopen = () => {

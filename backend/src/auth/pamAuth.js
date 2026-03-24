@@ -1,116 +1,191 @@
-import { execSync } from 'child_process';
-import { createRequire } from 'module';
+import { execSync, exec, spawn } from 'child_process';
+import { promisify } from 'util';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
-// PAM authentication for Linux system users
-// Falls back to shadow file comparison in environments where pam is unavailable
-let pamAuth;
-try {
-  const require = createRequire(import.meta.url);
-  pamAuth = require('authenticate-pam');
-} catch {
-  console.warn('[Auth] PAM module not available, using shadow fallback');
-  pamAuth = null;
-}
+const execAsync = promisify(exec);
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Path to the Python helper script (same directory as this file)
+const VERIFY_SCRIPT = join(__dirname, 'verifyPassword.py');
 
 /**
- * Authenticate a user against the Linux system using PAM.
- * Returns user info including whether they have sudo/admin rights.
+ * Authenticate a user against the Linux system.
+ *
+ * For local users: uses Python crypt + spwd to verify against /etc/shadow
+ *   Requires backend user in shadow group:
+ *   sudo usermod -aG shadow $USER  (then re-login or: exec su -l $USER)
+ *
+ * For remote-only users: uses sshpass SSH password auth
+ *   sudo apt install sshpass
  */
 export async function authenticateSystemUser(username, password) {
-  // Validate username format (prevent injection)
   if (!/^[a-z_][a-z0-9_-]{0,30}$/.test(username)) {
     throw new Error('Invalid username format');
   }
 
-  // Try PAM authentication
-  if (pamAuth) {
-    await new Promise((resolve, reject) => {
-      pamAuth.authenticate(username, password, (err) => {
-        if (err) reject(new Error('Authentication failed'));
-        else resolve();
-      }, { serviceName: 'login' });
-    });
-  } else {
-    // Development fallback: check against demo accounts
-    await fallbackAuth(username, password);
+  const existsLocally = userExistsLocally(username);
+
+  if (existsLocally) {
+    await authenticateViaPython(username, password);
+    return getUserInfo(username);
   }
 
-  // Fetch user info after successful auth
-  const userInfo = await getUserInfo(username);
-  return userInfo;
+  // User not local — try remote nodes via sshpass
+  const remoteNodes = [
+    {
+      host: process.env.NODE1_HOST || 'dilab.ssu.ac.kr',
+      port: process.env.NODE1_SSH_PORT || '2222',
+      label: 'dilab (Node 1)'
+    }
+  ];
+
+  for (const node of remoteNodes) {
+    const result = await trySSHAuth(username, password, node);
+    if (result.success) {
+      console.log(`[Auth] ${username} authenticated via SSH on ${node.label}`);
+      return result.userInfo;
+    }
+  }
+
+  throw new Error('Authentication failed');
 }
 
 /**
- * Get system user info: uid, groups, admin status.
+ * Verify password using Python's crypt + spwd modules.
+ * Works with all hash types including yescrypt ($y$), SHA-512 ($6$), bcrypt ($2b$).
+ * Requires the backend user to be in the 'shadow' group.
  */
-async function getUserInfo(username) {
+function authenticateViaPython(username, password) {
+  return new Promise((resolve, reject) => {
+    // Pass password via stdin to avoid it appearing in process list
+    const child = spawn('/usr/bin/python3', [VERIFY_SCRIPT, username], {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    let stderr = '';
+    child.stderr.on('data', d => { stderr += d.toString(); });
+
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error('Authentication timed out'));
+    }, 5000);
+
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve();
+      } else if (code === 2) {
+        // Script error (permission denied, user not found)
+        console.error(`[Auth] Password verify error: ${stderr.trim()}`);
+        reject(new Error(stderr.trim() || 'Authentication error'));
+      } else {
+        reject(new Error('Authentication failed'));
+      }
+    });
+
+    // Send password via stdin
+    child.stdin.write(password + '\n');
+    child.stdin.end();
+  });
+}
+
+/**
+ * SSH password auth against a remote node using sshpass.
+ * Install: sudo apt install sshpass
+ */
+async function trySSHAuth(username, password, node) {
+  if (!(await commandExists('sshpass'))) {
+    console.warn('[Auth] sshpass not installed — remote user auth unavailable. Run: sudo apt install sshpass');
+    return { success: false };
+  }
+
+  try {
+    const { stdout } = await execAsync(
+      `sshpass -p ${shellEscape(password)} ssh` +
+      ` -o StrictHostKeyChecking=no` +
+      ` -o ConnectTimeout=5` +
+      ` -o BatchMode=no` +
+      ` -o PreferredAuthentications=password` +
+      ` -o PubkeyAuthentication=no` +
+      ` -p ${node.port} ${username}@${node.host} id`,
+      { timeout: 8000 }
+    );
+    const userInfo = parseIdOutput(username, stdout.trim(), node.label);
+    return { success: true, userInfo };
+  } catch {
+    return { success: false };
+  }
+}
+
+function shellEscape(str) {
+  return `'${str.replace(/'/g, "'\\''")}'`;
+}
+
+function parseIdOutput(username, idOutput, nodeLabel) {
+  const uidMatch = idOutput.match(/uid=(\d+)\(([^)]+)\)/);
+  const groupsMatch = idOutput.match(/groups=([^\n]+)/);
+  const uid = uidMatch ? parseInt(uidMatch[1]) : null;
+  const groupsList = groupsMatch
+    ? groupsMatch[1].split(',').map(g => {
+        const m = g.trim().match(/\d+\(([^)]+)\)/);
+        return m ? m[1] : null;
+      }).filter(Boolean)
+    : [];
+  const isAdmin = groupsList.some(g => ['sudo', 'admin', 'wheel'].includes(g));
+  return {
+    username,
+    displayName: username,
+    uid,
+    groups: groupsList,
+    isAdmin,
+    homeDir: `/home/${username}`,
+    authenticatedVia: nodeLabel
+  };
+}
+
+function userExistsLocally(username) {
+  try {
+    execSync(`getent passwd ${username}`, { stdio: 'pipe', timeout: 2000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function commandExists(cmd) {
+  try {
+    await execAsync(`which ${cmd}`, { timeout: 2000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function getUserInfo(username) {
   try {
     const idOutput = execSync(`id ${username}`, { encoding: 'utf8', timeout: 3000 }).trim();
-    // Parse: uid=1001(username) gid=1001(username) groups=1001(username),27(sudo),4(adm)
-    const uidMatch = idOutput.match(/uid=(\d+)\(([^)]+)\)/);
-    const groupsMatch = idOutput.match(/groups=([^\n]+)/);
-    const uid = uidMatch ? parseInt(uidMatch[1]) : null;
-    const groupsList = groupsMatch
-      ? groupsMatch[1].split(',').map(g => {
-          const m = g.trim().match(/\d+\(([^)]+)\)/);
-          return m ? m[1] : g.trim().replace(/^\d+$/, '');
-        })
-      : [];
-
-    const isAdmin = groupsList.some(g => ['sudo', 'admin', 'wheel'].includes(g));
-
-    // Get display name from passwd
-    let displayName = username;
-    try {
-      const passwdLine = execSync(`getent passwd ${username}`, { encoding: 'utf8', timeout: 2000 }).trim();
-      const parts = passwdLine.split(':');
-      if (parts[4]) displayName = parts[4].split(',')[0] || username;
-    } catch {}
-
-    return {
-      username,
-      displayName,
-      uid,
-      groups: groupsList,
-      isAdmin,
-      homeDir: `/home/${username}`
-    };
+    return parseIdOutput(username, idOutput, 'local');
   } catch (err) {
     console.error('[Auth] getUserInfo failed:', err.message);
     return { username, displayName: username, uid: null, groups: [], isAdmin: false };
   }
 }
 
-/**
- * Development/fallback auth when PAM is not available.
- * In production, remove this and rely solely on PAM.
- */
-const DEV_USERS = {
-  admin: { password: 'admin123', isAdmin: true },
-  researcher1: { password: 'pass123', isAdmin: false },
-  researcher2: { password: 'pass123', isAdmin: false }
-};
-
-async function fallbackAuth(username, password) {
-  const user = DEV_USERS[username];
-  if (!user || user.password !== password) {
-    throw new Error('Authentication failed');
-  }
-}
-
-/**
- * Get list of human users on the system (uid 1000-65533)
- */
 export function getSystemUsers() {
   try {
     const output = execSync(
       `getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1","$5","$3","$6}'`,
       { encoding: 'utf8', timeout: 5000 }
     ).trim();
-
     return output.split('\n').filter(Boolean).map(line => {
       const [username, displayName, uid, homeDir] = line.split(',');
-      return { username, displayName: displayName?.split(',')?.[0] || username, uid: parseInt(uid), homeDir };
+      return {
+        username,
+        displayName: displayName?.split(',')?.[0] || username,
+        uid: parseInt(uid),
+        homeDir
+      };
     });
   } catch (err) {
     console.error('[Auth] getSystemUsers failed:', err.message);

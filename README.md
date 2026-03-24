@@ -1,7 +1,9 @@
 # DILab Server Monitor
 
 > **Full-stack server management and monitoring platform for the DILab AI Research Lab.**
-> Real-time GPU thermals, VRAM zombie detection, per-user resource tracking, and a collaborative dataset hub — across both Ubuntu 22.04 nodes.
+> Real-time GPU thermals, VRAM zombie detection, tmux terminal, per-user resource tracking,
+> open ports, SSH sessions, storage analytics, and a collaborative dataset hub —
+> across both Ubuntu 22.04 nodes via live WebSocket streaming.
 
 ---
 
@@ -12,56 +14,58 @@
 3. [Tech Stack](#tech-stack)
 4. [Step-by-Step Setup](#step-by-step-setup)
 5. [Authentication Flow](#authentication-flow)
-6. [Backend Design Decisions](#backend-design-decisions)
-7. [Feature Guide](#feature-guide)
-8. [SSH Monitor User Setup](#ssh-monitor-user-setup)
-9. [Deployment](#deployment)
-10. [Security Notes](#security-notes)
+6. [Feature Access & Permission Model](#feature-access--permission-model)
+7. [Adding & Removing Nodes](#adding--removing-nodes)
+8. [Feature Guide](#feature-guide)
+9. [SSH Monitor User Setup](#ssh-monitor-user-setup)
+10. [Deployment](#deployment)
+11. [Security Notes](#security-notes)
 
 ---
 
 ## Architecture Overview
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    Browser (Researcher)                     │
-│  React + Vite + Tailwind  ·  Zustand  ·  React Query       │
-│  WebSocket (live metrics) ·  REST (datasets, kill, auth)   │
-└───────────────────────────┬────────────────────────────────┘
-                            │ HTTP / WS
-┌───────────────────────────▼────────────────────────────────┐
-│              Node.js Backend (Fastify)                      │
-│                                                             │
-│  /api/auth      ── PAM Linux auth → JWT issuance           │
-│  /api/monitoring── Cached snapshots, historical ring buf   │
-│  /api/processes ── List, zombie-detect, kill               │
-│  /api/datasets  ── CRUD + rsync SSE sync                   │
-│  /ws/metrics    ── WebSocket broadcast (5s interval)       │
-│                                                             │
-│  Scheduler (node-cron, 5s) ──► SSH Manager                 │
-│                                    │                        │
-└────────────────────────────────────┼───────────────────────┘
-                SSH (ssh2)           │
-        ┌────────────────────────────┼────────────────────┐
-        │                           │                     │
-┌───────▼───────┐           ┌───────▼──────────┐
-│  dilab (Node 1)│           │  dilab2 (Node 2) │
-│  2× RTX 3090  │           │  4× RTX 4090     │
-│  18c / 251 GB │           │  40c / 440 GB    │
-│               │           │  ⚠ Post-cooling  │
-│  nvidia-smi   │           │  repair: thermal │
-│  sensors      │           │  priority active │
-│  ps aux / top │           │                  │
-│  df -h        │           │                  │
-└───────────────┘           └──────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                     Browser (Researcher)                        │
+│  React 18 + Vite + Tailwind  ·  Zustand  ·  TanStack Query     │
+│  xterm.js (terminal)  ·  Recharts  ·  WebSocket (live metrics)  │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ HTTP + WebSocket
+┌──────────────────────────────▼──────────────────────────────────┐
+│                  Node.js Backend  (Fastify)                     │
+│                  Hosted on dilab2.ssghu.ac.kr                   │
+│                                                                 │
+│  /api/auth        ── PAM/shadow auth → JWT (8h TTL)            │
+│  /api/monitoring  ── Cached snapshots + historical ring buf     │
+│  /api/processes   ── List, zombie-detect, kill                  │
+│  /api/extras      ── Ports, SSH sessions, storage-by-user       │
+│  /api/datasets    ── CRUD + rsync SSE sync                      │
+│  /api/terminal    ── tmux WebSocket bridge (xterm.js)           │
+│  /ws/metrics      ── WebSocket broadcast (5s interval)          │
+│                                                                 │
+│  node-cron (5s) ──► SSH Manager ──► MetricsCache ──► WS push   │
+│                                                                 │
+└───────────────┬──────────────────────────┬──────────────────────┘
+                │ SSH (ssh2) port 2222      │ local child_process
+                │                          │ (NODE_LOCAL_ID=node2)
+┌───────────────▼──────────┐  ┌────────────▼────────────────────┐
+│   dilab (Node 1)         │  │   dilab2 (Node 2) — LOCAL       │
+│   dilab.ssu.ac.kr:2222   │  │   dilab2.ssghu.ac.kr            │
+│   2× RTX 3090            │  │   4× RTX 4090                   │
+│   18 cores / 251 GB RAM  │  │   40 cores / 440 GB RAM         │
+│                          │  │   ⚠ Post-cooling repair:        │
+│   monitor user (SSH)     │  │     thermal priority active     │
+└──────────────────────────┘  └─────────────────────────────────┘
 ```
 
 **Data flow for live metrics:**
-1. `node-cron` fires every 5 seconds on the backend.
-2. The scheduler runs `fetchFullNodeSnapshot()` on both nodes **concurrently** via parallel SSH.
-3. Parsed data is stored in `MetricsCache` (in-memory, 30-min ring buffer).
-4. The result is broadcast to all connected WebSocket clients.
-5. The frontend Zustand store receives the WS message and updates all reactive components atomically.
+1. `node-cron` fires every 5 seconds
+2. Scheduler fetches both nodes **concurrently** via `Promise.allSettled`
+3. dilab2 runs commands via local `child_process.exec` (zero SSH overhead)
+4. dilab runs commands over the persistent SSH connection
+5. Parsed data stored in `MetricsCache` (360-entry ring buffer = 30 min history)
+6. Broadcast to all connected WebSocket clients atomically
 
 ---
 
@@ -69,25 +73,29 @@
 
 ```
 dilab-monitor/
+├── README.md
 ├── backend/
 │   ├── .env.example
 │   ├── package.json
 │   └── src/
-│       ├── index.js                  # Fastify server, plugin registration
+│       ├── index.js                      # Fastify server + plugin registration
 │       ├── auth/
-│       │   ├── pamAuth.js            # PAM/system user authentication + userInfo
-│       │   └── routes.js             # POST /login, GET /me, POST /refresh
+│       │   ├── pamAuth.js                # Python crypt + sshpass auth strategy
+│       │   ├── routes.js                 # POST /login, GET /me, POST /refresh
+│       │   └── verifyPassword.py         # /etc/shadow verifier (Python 3.13+ safe)
 │       ├── monitoring/
-│       │   ├── monitoringService.js  # nvidia-smi, sensors, top, df parsers
-│       │   ├── routes.js             # GET /all, /node/:id, /alerts, /historical
-│       │   ├── processRoutes.js      # GET /list, /zombies; POST /kill, /kill-zombie-batch
-│       │   └── scheduler.js         # node-cron 5s polling + MetricsCache + WS broadcast
+│       │   ├── monitoringService.js      # All SSH command parsers + zombie detection
+│       │   ├── routes.js                 # GET /all, /node/:id, /alerts, /historical
+│       │   ├── processRoutes.js          # GET /list, /zombies; POST /kill, /kill-batch
+│       │   ├── extrasRoutes.js           # GET /ports, /ssh-sessions, /storage-by-user
+│       │   ├── terminalRoutes.js         # WebSocket tmux bridge
+│       │   └── scheduler.js             # node-cron polling + MetricsCache + WS broadcast
 │       ├── ssh/
-│       │   └── sshManager.js        # Connection pool, execOnNode, execOnAllNodes, execStream
+│       │   └── sshManager.js            # Connection pool, local/remote exec routing
 │       ├── datasets/
-│       │   └── routes.js            # CRUD + rsync SSE sync endpoint
+│       │   └── routes.js                # CRUD + rsync SSE streaming
 │       └── utils/
-│           └── database.js          # better-sqlite3 init, schema migrations, seed tags
+│           └── database.js              # better-sqlite3 init + schema + tag seeds
 │
 └── frontend/
     ├── index.html
@@ -97,28 +105,34 @@ dilab-monitor/
     ├── package.json
     └── src/
         ├── main.jsx
-        ├── App.jsx                   # Router, WS init, QueryClient
-        ├── index.css                 # Tailwind + custom CSS vars, animations
+        ├── App.jsx                       # Router + WS init + QueryClient
+        ├── index.css                     # Tailwind + custom CSS vars + animations
+        ├── hooks/
+        │   └── usePermissions.js         # ★ Centralized permission matrix
         ├── pages/
-        │   ├── LoginPage.jsx         # PAM credential form
-        │   ├── DashboardPage.jsx     # Main overview: nodes, thermals, storage, users
-        │   ├── ProcessesPage.jsx     # Process list, zombie table, kill buttons
-        │   └── DatasetsPage.jsx      # Dataset hub: register, tag, sync
+        │   ├── LoginPage.jsx             # System credential form
+        │   ├── DashboardPage.jsx         # Overview: nodes, thermals, ports, SSH, users
+        │   ├── ProcessesPage.jsx         # Processes, VRAM, zombies, kill switch
+        │   ├── StoragePage.jsx           # Filesystem overview + per-user usage + chart
+        │   ├── DatasetsPage.jsx          # Dataset hub: register, tag, markdown, sync
+        │   └── TerminalPage.jsx          # xterm.js + tmux multi-tab terminal
         ├── components/
         │   ├── dashboard/
-        │   │   └── Layout.jsx        # Sidebar, nav, status pills
+        │   │   └── Layout.jsx            # Sidebar nav + status pills + alert count
         │   └── monitoring/
-        │       ├── AlertBanner.jsx   # Flashing critical/warning banner
-        │       ├── NodeCard.jsx      # Per-node overview card with mini sparklines
-        │       ├── ThermalPanel.jsx  # GPU gauges + sparklines, CPU core temps
-        │       ├── StoragePanel.jsx  # Filesystem bars (NVMe vs SATA)
-        │       └── UserResourceTable.jsx  # Per-user CPU/RAM/VRAM breakdown
+        │       ├── AlertBanner.jsx       # Flashing critical/warning banner
+        │       ├── NodeCard.jsx          # Per-node card with sparklines
+        │       ├── ThermalPanel.jsx      # GPU arc gauges + CPU core grid
+        │       ├── StoragePanel.jsx      # Filesystem bars
+        │       ├── UserResourceTable.jsx # Per-user CPU/RAM/VRAM table
+        │       ├── OpenPortsCard.jsx     # Listening ports with process/user info
+        │       └── SSHSessionsCard.jsx   # Active sessions + recent login history
         ├── stores/
-        │   ├── authStore.js          # Zustand auth (persisted), login/logout
-        │   └── metricsStore.js       # WS client, metrics state, history buffer
+        │   ├── authStore.js              # Zustand auth (persisted JWT)
+        │   └── metricsStore.js           # WS client + metrics state + history buffer
         └── utils/
-            ├── api.js                # Axios instance, 401 interceptor
-            └── format.js            # formatMiB, getThermalColor, relativeTime…
+            ├── api.js                    # Axios instance + 401 interceptor
+            └── format.js                # formatMiB, getThermalColor, relativeTime…
 ```
 
 ---
@@ -127,29 +141,40 @@ dilab-monitor/
 
 | Layer | Technology | Why |
 |-------|-----------|-----|
-| Frontend | React 18 + Vite | Fast HMR, modern React features |
-| Styling | Tailwind CSS v3 | Utility-first, dark mode, custom theme |
-| Charts | Recharts | Lightweight, composable area/line charts |
+| Frontend | React 18 + Vite | Fast HMR, modern React |
+| Styling | Tailwind CSS v3 | Utility-first dark theme |
+| Terminal | xterm.js v5 | Full VT100/256-color PTY rendering |
+| Charts | Recharts | Composable area/line/bar charts |
 | State | Zustand | Minimal boilerplate, persist middleware |
-| Data fetching | TanStack Query | Automatic refetch, mutation + cache |
-| Real-time | Native WebSocket | Direct push, no Socket.IO overhead |
-| Backend | Fastify v4 | High-throughput, schema validation, plugin ecosystem |
-| SSH | ssh2 | Mature Node.js SSH client, exec + stream |
-| Auth | PAM (authenticate-pam) + JWT | Authentic Linux user auth, stateless API |
-| Database | better-sqlite3 | Zero-config, fast, perfect for metadata |
-| Scheduler | node-cron | Cron-based polling trigger |
+| Data fetching | TanStack Query | Auto-refetch, mutation cache |
+| Real-time | Native WebSocket | Direct push, minimal overhead |
+| Backend | Fastify v4 | High-throughput, schema validation |
+| SSH | ssh2 | Persistent connections, exec + PTY shell |
+| Auth | Python crypt + sshpass | No native modules, works with yescrypt |
+| Database | better-sqlite3 | Zero-config, fast, dataset metadata |
+| Scheduler | node-cron | 5-second polling trigger |
 
 ---
 
 ## Step-by-Step Setup
 
-### Prerequisites on the server running the backend
+### Prerequisites
 
 ```bash
-# Ubuntu 22.04
-sudo apt install -y libpam-dev build-essential
-# For sensor readings on both monitored nodes:
-sudo apt install -y lm-sensors
+# On dilab2 (backend host):
+sudo apt install -y libpam-dev build-essential pamtester sshpass tmux
+pip install crypt-r           # Python 3.13+ yescrypt support
+
+# Shadow group for password verification:
+sudo usermod -aG shadow $USER
+exec su -l $USER              # apply without logout
+
+# Sudoers for storage scanning:
+echo "$USER ALL=(ALL) NOPASSWD: /usr/bin/du" | sudo tee /etc/sudoers.d/dilab-du
+sudo chmod 440 /etc/sudoers.d/dilab-du
+
+# On dilab (node1) — install tools the monitor user will run:
+sudo apt install -y lm-sensors nvidia-utils-535 tmux
 sudo sensors-detect --auto
 ```
 
@@ -157,152 +182,259 @@ sudo sensors-detect --auto
 
 ```bash
 git clone <repo> dilab-monitor && cd dilab-monitor
-
-# Backend
 cp backend/.env.example backend/.env
-# Edit backend/.env — set JWT_SECRET, SSH_KEY_PATH, etc.
-nano backend/.env
-
-# Install
-cd backend && npm install
-cd ../frontend && npm install
+nano backend/.env   # set JWT_SECRET, SSH_KEY_PATH, NODE_LOCAL_ID=node2
 ```
 
-### 2. Set up SSH key auth to both nodes
+### 2. SSH key setup (for dilab / node1 only)
 
 ```bash
-# On the backend server, as the user running Node.js:
-ssh-keygen -t ed25519 -C "dilab-monitor" -f ~/.ssh/dilab_monitor
+# Generate key on dilab2:
+ssh-keygen -t ed25519 -C "dilab-monitor" -f ~/.ssh/dilab_monitor -N ""
 
-# Copy to both nodes
-ssh-copy-id -i ~/.ssh/dilab_monitor.pub monitor@dilab.ssghu.ac.kr
-ssh-copy-id -i ~/.ssh/dilab_monitor.pub monitor@dilab2.ssghu.ac.kr
+# Copy to dilab via your own account:
+ssh -p 2222 yourname@dilab.ssu.ac.kr
+sudo mkdir -p /home/monitor/.ssh
+sudo bash -c 'cat >> /home/monitor/.ssh/authorized_keys' << 'KEY'
+PASTE_CONTENT_OF_~/.ssh/dilab_monitor.pub_HERE
+KEY
+sudo chmod 700 /home/monitor/.ssh
+sudo chmod 600 /home/monitor/.ssh/authorized_keys
+sudo chown -R monitor:monitor /home/monitor/.ssh
+sudo usermod -s /bin/bash monitor
 
-# In .env:
-SSH_KEY_PATH=/home/youruser/.ssh/dilab_monitor
-SSH_USER=monitor
+# Test:
+ssh -i ~/.ssh/dilab_monitor -p 2222 monitor@dilab.ssu.ac.kr "whoami"
 ```
 
-### 3. Create the `monitor` system user on both nodes
-
-See [SSH Monitor User Setup](#ssh-monitor-user-setup).
-
-### 4. Run development servers
+### 3. Install & run
 
 ```bash
-# Terminal 1 — Backend
-cd backend && npm run dev
+# Backend:
+cd backend && npm install && npm run dev
 
-# Terminal 2 — Frontend
-cd frontend && npm run dev
+# Frontend (separate terminal):
+cd frontend && npm install && npm run dev
 # → http://localhost:5173
 ```
 
-### 5. Login
+### 4. Login
 
-Use any valid Linux system account on the server running the backend. Admin access is granted if the user is in the `sudo` or `admin` group.
+Use any Linux system account on dilab2. Admin access is granted automatically for users in the `sudo` group.
 
 ---
 
 ## Authentication Flow
 
 ```
-Browser                    Fastify Backend              Linux OS
-  │                              │                          │
-  │  POST /api/auth/login        │                          │
-  │  { username, password }      │                          │
-  ├─────────────────────────────►│                          │
-  │                              │  pamAuth.authenticate()  │
-  │                              ├─────────────────────────►│
-  │                              │  PAM module validates    │
-  │                              │  against /etc/shadow     │
-  │                              │  (or LDAP/AD if set up)  │
-  │                              │◄─────────────────────────┤
-  │                              │                          │
-  │                              │  getent passwd $user     │
-  │                              │  id $user → groups       │
-  │                              │  isAdmin = sudo ∈ groups │
-  │                              │                          │
-  │                              │  jwt.sign({              │
-  │                              │    username, isAdmin,    │
-  │                              │    groups, uid           │
-  │                              │  }, expiresIn: 8h)       │
-  │                              │                          │
-  │◄─────────────────────────────┤                          │
-  │  { token, user }             │                          │
-  │                              │                          │
-  │  Store token in Zustand      │                          │
-  │  (persisted to localStorage) │                          │
-  │                              │                          │
-  │  All subsequent requests:    │                          │
-  │  Authorization: Bearer <tok> │                          │
+Browser                    Backend                      Linux OS
+  │                           │                             │
+  │  POST /api/auth/login     │                             │
+  │  { username, password }   │                             │
+  ├──────────────────────────►│                             │
+  │                           │  userExistsLocally()?       │
+  │                           │  getent passwd $user        │
+  │                           │                             │
+  │                           │  YES → verifyPassword.py    │
+  │                           │    reads /etc/shadow        │
+  │                           │    crypt.crypt(pass, hash)  │
+  │                           │    supports yescrypt $y$    │
+  │                           │                             │
+  │                           │  NO → sshpass SSH to node1  │
+  │                           │    ssh user@dilab.ssu.ac.kr │
+  │                           │    runs `id` command        │
+  │                           │                             │
+  │                           │  jwt.sign({                 │
+  │                           │    username, isAdmin,       │
+  │                           │    groups, uid, exp: 8h     │
+  │                           │  })                         │
+  │◄──────────────────────────│                             │
+  │  { token, user }          │                             │
+  │                           │                             │
+  │  Zustand + localStorage   │                             │
+  │  Authorization: Bearer …  │                             │
 ```
 
-**Key security properties:**
-- Passwords are never stored anywhere — PAM validates against the real system
-- JWT contains `isAdmin` flag derived from real Linux group membership (`sudo`/`admin`/`wheel`)
-- Admins can kill any process; standard users can only kill their own
-- Failed logins trigger a 500ms random delay + in-memory rate limiting (10 attempts / 15 min per IP)
-- JWTs expire in 8 hours; auto-refresh is available
+**isAdmin** is determined by real Linux group membership: `sudo`, `admin`, or `wheel`.
 
 ---
 
-## Backend Design Decisions
+## Feature Access & Permission Model
 
-### SSH Connection Pool (`sshManager.js`)
+All access control flows through a **single hook** on the frontend and **decorator checks** on the backend. This is the complete matrix:
 
-Persistent SSH connections are maintained per node with **exponential backoff reconnection** (1s → 2s → 4s … capped at 30s). This avoids the latency of establishing a new SSH session on every 5-second poll. A keepalive ping fires every 15 seconds to prevent idle timeouts.
+| Action | Standard User | Admin (sudo group) | Implementation |
+|--------|:---:|:---:|---|
+| View dashboard / metrics | ✅ | ✅ | `authenticate` hook on all routes |
+| View processes | ✅ | ✅ | `authenticate` hook |
+| View open ports | ✅ | ✅ | `authenticate` hook |
+| View SSH sessions | ✅ | ✅ | `authenticate` hook |
+| View storage overview | ✅ | ✅ | `authenticate` hook |
+| View per-user storage | ✅ | ✅ | `authenticate` hook |
+| View datasets | ✅ | ✅ | `authenticate` hook |
+| Kill **own** process | ✅ | ✅ | `proc.user === username` check |
+| Kill **other users'** process | ❌ | ✅ | `isAdmin` check in `processRoutes.js` |
+| Batch kill zombies | ❌ | ✅ | `requireAdmin` decorator |
+| Register dataset | ✅ | ✅ | Authenticated, owner set to caller |
+| Edit / delete **own** dataset | ✅ | ✅ | `dataset.owner === username` check |
+| Edit / delete **any** dataset | ❌ | ✅ | `isAdmin` check in `datasets/routes.js` |
+| Sync dataset | ✅ (own) | ✅ | Owner or admin check |
+| Open **own** tmux session | ✅ | ✅ | session name must equal username |
+| Attach to **any** tmux session | ❌ | ✅ | `isAdmin` check in `terminalRoutes.js` |
+| Create named tmux session | ❌ | ✅ | `isAdmin` check in `terminalRoutes.js` |
 
+### Frontend enforcement — `usePermissions` hook
+
+All UI gating flows through `src/hooks/usePermissions.js`:
+
+```js
+import { usePermissions } from '../hooks/usePermissions';
+
+function MyComponent({ process }) {
+  const { can } = usePermissions();
+
+  return (
+    <>
+      {/* Visible to everyone */}
+      <ProcessInfo proc={process} />
+
+      {/* Only shown if user owns it OR is admin */}
+      {can('kill:own', process.user) && <KillButton proc={process} />}
+
+      {/* Only shown to admins */}
+      {can('kill:any') && <ForceKillAllButton />}
+    </>
+  );
+}
 ```
-execOnNode(nodeId, cmd)      — single node, returns stdout string
-execOnAllNodes(cmd)          — both nodes concurrently, returns { node1, node2 }
-execStreamOnNode(nodeId, cmd, onData, onError)  — streaming (rsync)
+
+### Backend enforcement — Fastify decorators
+
+```js
+// Require any valid JWT:
+fastify.addHook('onRequest', fastify.authenticate);
+
+// Require admin (isAdmin: true in JWT):
+fastify.addHook('onRequest', fastify.requireAdmin);
+
+// Require ownership OR admin (in route handler):
+if (resource.owner !== request.user.username && !request.user.isAdmin) {
+  return reply.status(403).send({ error: 'Forbidden' });
+}
 ```
 
-### Metrics Parsing Strategy
+### Adding a new permission level
 
-All monitoring data is fetched with a **single composite shell command** per domain (system metrics, GPU, storage) rather than multiple round-trips, dramatically reducing SSH latency per poll cycle:
+To add a "Lab Manager" role (can kill processes but not manage all datasets):
+
+**1. Add the group check in `pamAuth.js`:**
+```js
+const isLabManager = groupsList.includes('labmanager');
+// Add to JWT payload:
+return { username, isAdmin, isLabManager, groups, ... };
+```
+
+**2. Add to `usePermissions.js`:**
+```js
+const isLabManager = user?.isLabManager ?? false;
+
+case 'kill:any':
+  return isAdmin || isLabManager;  // lab managers can also kill processes
+```
+
+**3. Create the Linux group on both servers:**
+```bash
+sudo groupadd labmanager
+sudo usermod -aG labmanager username
+```
+
+---
+
+## Adding & Removing Nodes
+
+The node registry is the **single source of truth**. You only ever touch two files.
+
+### Adding a new node
+
+**Step 1 — `backend/src/ssh/sshManager.js`**: add to the `NODES` object:
+
+```js
+export const NODES = {
+  node1: { ... },
+  node2: { ... },
+
+  // ADD THIS:
+  node3: {
+    id: 'node3',
+    label: 'dilab3 (Node 3)',
+    host: process.env.NODE3_HOST || 'dilab3.ssu.ac.kr',
+    port: parseInt(process.env.NODE3_SSH_PORT || '22'),
+    username: process.env.SSH_USER || 'monitor',
+    specs: {
+      gpus: ['RTX 4090', 'RTX 4090'],
+      cores: 32,
+      ramGB: 256,
+      gpuThermalCritical: false  // set true if post-repair thermal monitoring needed
+    }
+  }
+};
+```
+
+**Step 2 — `backend/.env`**: add host variables:
 
 ```bash
-# One SSH call fetches CPU%, load avg, RAM, swap, uptime, core count:
-echo "=CPU_USAGE=" && top -bn1 | grep "Cpu(s)" | ...
-echo "=MEM=" && free -m | ...
-echo "=UPTIME=" && uptime -p
+NODE3_HOST=dilab3.ssu.ac.kr
+NODE3_SSH_PORT=22
+# No SSH_PASS needed if using key auth (recommended)
 ```
 
-### Zombie Process Detection
+**Step 3 — Set up the `monitor` user on the new server** (same as dilab node1 setup above).
 
-Zombie processes are tracked using a **rolling counter per `(nodeId, pid)` pair**:
-
-```
-gpuUtilHistory: Map<"node1-1234", zeroUtilCount>
-
-Every poll cycle:
-  if process holds VRAM AND gpuUtil === 0:
-    zeroUtilCount++
-    if zeroUtilCount >= 60 (≈ 5 min at 5s intervals):
-      isZombie = true
-  else:
-    delete from history  ← clears if process resumes or exits
+**Step 4 — Copy SSH public key** to the new server:
+```bash
+ssh-copy-id -i ~/.ssh/dilab_monitor.pub -p 22 monitor@dilab3.ssu.ac.kr
 ```
 
-PIDs that no longer appear in `ps aux` are cleaned up automatically via `cleanupZombieHistory()`.
+**That's it.** Everything else reads `Object.keys(NODES)` dynamically:
+- SSH manager creates connections for all nodes automatically
+- Scheduler polls all nodes concurrently
+- REST endpoints accept any valid `nodeId` from the registry
+- Frontend `NodeCard`, `ThermalPanel`, `StoragePanel` all accept `nodeId` as a prop
 
-### Dataset Sync (rsync over SSH)
+**For the frontend**, update `DashboardPage.jsx` to loop over nodes rather than hardcoding:
 
-The sync endpoint uses **Server-Sent Events (SSE)** to stream rsync progress:
+```jsx
+// Instead of hardcoding node1/node2, read from a config:
+const NODES = [
+  { id: 'node1', label: 'dilab' },
+  { id: 'node2', label: 'dilab2', missionCritical: true },
+  { id: 'node3', label: 'dilab3' },  // ← add here
+];
 
+// Then render dynamically:
+{NODES.map(node => (
+  <NodeCard key={node.id} nodeId={node.id} nodeData={metrics?.[node.id]} />
+))}
 ```
-POST /api/datasets/:id/sync
-→ Content-Type: text/event-stream
 
-data: {"type":"start","message":"Starting rsync..."}
-data: {"type":"progress","pct":24,"speed":"125MB/s","eta":"0:02:14"}
-data: {"type":"output","text":"sending incremental file list"}
-data: {"type":"complete","totalBytes":8589934592}
+### Removing a node
+
+**Step 1** — Delete the entry from `NODES` in `sshManager.js`.
+
+**Step 2** — Remove the corresponding `NODE3_HOST` / `NODE3_SSH_PORT` lines from `.env`.
+
+**Step 3** — Remove the node from `DashboardPage.jsx`'s `NODES` array if hardcoded.
+
+Restart the backend — the removed node will no longer appear anywhere in the UI.
+
+### Setting a node as "local" (no SSH)
+
+If you move the backend to a different server, update `.env`:
+```bash
+# Backend is now on node1:
+NODE_LOCAL_ID=node1
 ```
-
-The frontend renders a live progress bar by consuming the SSE stream via `fetch()` + `ReadableStream`.
+That node will use `child_process.exec` instead of SSH — no `monitor` user needed on it.
 
 ---
 
@@ -310,64 +442,77 @@ The frontend renders a live progress bar by consuming the SSE stream via `fetch(
 
 ### Dashboard (`/`)
 
-| Panel | What it shows |
-|-------|--------------|
-| **Node Cards** | CPU%, RAM%, per-GPU: temp, VRAM%, util%, power draw. Mini sparklines (last 5 min) |
-| **Alert Banner** | Flashing red cards for critical GPU temps or >95% RAM. Mission-critical flag for dilab2 post-cooling repair |
-| **Thermal Panel** | Arc gauge per GPU with temp history sparkline, fan %, wattage. CPU core grid |
-| **Storage Panel** | All mounted filesystems with NVMe/SATA distinction, usage bars |
-| **User Table** | Every researcher's current CPU, RAM, VRAM footprint across both nodes |
+| Panel | What it shows | Refresh |
+|-------|--------------|---------|
+| **Alert Banner** | Flashing critical GPU/RAM alerts with post-repair badge for dilab2 | 5s (WS) |
+| **Node Cards** | CPU%, RAM%, per-GPU temp/VRAM/util, load avg, mini sparklines | 5s (WS) |
+| **Thermal Panels** | Arc gauges per GPU, temp history sparklines, CPU core grid | 5s (WS) |
+| **Storage Panels** | Filesystems with NVMe/SATA distinction, usage bars | 5s (WS) |
+| **SSH Sessions** | Active sessions per node + recent login history | 15s |
+| **Open Ports** | Listening ports with process, PID, user, bind address | 30s |
+| **User Resource Table** | Every researcher's CPU, RAM, VRAM across both nodes | 5s (WS) |
 
 ### Processes & GPU (`/processes`)
 
 | Feature | Detail |
 |---------|--------|
-| **Process list** | All processes using >0.5% CPU or RAM, sorted by VRAM desc |
-| **VRAM column** | Per-process VRAM from `nvidia-smi --query-compute-apps` |
-| **Zombie badge** | Red skull icon on processes idle >5 min while holding VRAM |
-| **Kill button** | Graceful (SIGTERM) or force (SIGKILL). Two-step confirm. Admins kill anything; users kill only their own |
-| **Batch zombie kill** | Admin-only one-click kill of all zombies on a given node |
-| **Filters** | By node, by type (All/GPU/Zombies/Heavy), by text search |
+| Process list | All processes >0.5% CPU/RAM, sorted by VRAM desc |
+| VRAM column | Per-process from `nvidia-smi --query-compute-apps` |
+| Zombie badge | Skull icon — idle >5min while holding VRAM |
+| Kill buttons | Graceful (SIGTERM) / Force (SIGKILL) — two-step confirm |
+| Batch zombie kill | Admin-only one-click per node |
+| Filters | By node, type (All/GPU/Zombies/Heavy), text search |
+
+### Storage (`/storage`)
+
+| Tab | Detail |
+|-----|--------|
+| Overview | All filesystems per node, NVMe badge, used/free/total |
+| Per-User Usage | `sudo du` ranked list with hover mount breakdown |
+| Comparison | Stacked bar chart — both nodes side by side per user |
+
+### Terminal (`/terminal`)
+
+| Feature | Detail |
+|---------|--------|
+| tmux bridge | xterm.js → WebSocket → SSH PTY → tmux attach |
+| Multi-tab | Open multiple sessions simultaneously |
+| Node selector | Switch between dilab and dilab2 |
+| Session picker | List active sessions, create new ones |
+| Permission | Standard users: own session only. Admins: any session |
+| Resize | Terminal resizes automatically with the window |
 
 ### Dataset Hub (`/datasets`)
 
 | Feature | Detail |
 |---------|--------|
-| **Register** | Name, absolute path, node, Markdown description, tags |
-| **Tag system** | 12 pre-seeded tags + user-defined. Color-coded badges. Click to filter |
-| **Markdown README** | Collapsible in-card preview with GFM support |
-| **Sync** | Click → modal → rsync SSE stream with live progress bar |
-| **Access control** | Edit/delete own datasets; admins can edit any |
+| Register | Name, path, node, tags, Markdown README |
+| Tag system | 12 pre-seeded tags + user-defined, color-coded |
+| Sync | rsync over SSH with SSE progress bar |
+| Access | Edit/delete own datasets; admins edit any |
 
 ---
 
 ## SSH Monitor User Setup
 
-Create a limited `monitor` account on both nodes with just enough permissions:
-
 ```bash
-# On dilab and dilab2:
-sudo useradd -r -s /bin/bash -m monitor
+# On dilab (node1) — create limited monitor account:
+sudo useradd -r -m -s /bin/bash monitor
 
-# Allow nvidia-smi (world-readable, no sudo needed)
-# Allow sensors (may need sudo on some setups):
-echo "monitor ALL=(ALL) NOPASSWD: /usr/bin/sensors" | sudo tee /etc/sudoers.d/monitor-sensors
-
-# Allow kill for zombie cleanup (admin backend operations go via root SSH key instead):
-# For per-user kills, users SSH as themselves — the backend re-issues kill over their SSH session.
-# For admin batch kill, the monitor user needs:
-echo "monitor ALL=(ALL) NOPASSWD: /bin/kill" | sudo tee -a /etc/sudoers.d/monitor-sensors
-
-sudo chmod 440 /etc/sudoers.d/monitor-sensors
+# Allow specific commands without password:
+cat << 'EOF' | sudo tee /etc/sudoers.d/dilab-monitor
+monitor ALL=(ALL) NOPASSWD: /usr/bin/sensors
+monitor ALL=(ALL) NOPASSWD: /usr/bin/du
+monitor ALL=(ALL) NOPASSWD: /bin/kill
+EOF
+sudo chmod 440 /etc/sudoers.d/dilab-monitor
 ```
-
-> **Note:** For the admin kill feature to work cross-user, the backend can alternatively SSH as root (with a hardened key) for kill operations only, keeping `monitor` read-only for metrics.
 
 ---
 
 ## Deployment
 
-### Systemd service (backend)
+### Systemd service
 
 ```ini
 # /etc/systemd/system/dilab-monitor.service
@@ -377,7 +522,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=monitor
+User=oem
 WorkingDirectory=/opt/dilab-monitor/backend
 ExecStart=/usr/bin/node src/index.js
 Restart=always
@@ -397,26 +542,28 @@ sudo systemctl enable --now dilab-monitor
 ```nginx
 server {
     listen 80;
-    server_name monitor.dilab.ssghu.ac.kr;
+    server_name monitor.dilab.ssu.ac.kr;
 
-    # Frontend (static build)
+    # Frontend static build
     location / {
         root /opt/dilab-monitor/frontend/dist;
         try_files $uri $uri/ /index.html;
     }
 
-    # API + WebSocket
+    # API
     location /api/ {
         proxy_pass http://localhost:3001;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
     }
 
-    location /ws/ {
+    # WebSocket (metrics stream + terminal)
+    location ~ ^/(ws|api/terminal)/ {
         proxy_pass http://localhost:3001;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;   # keep terminal WS alive
     }
 }
 ```
@@ -425,17 +572,61 @@ server {
 
 ```bash
 cd frontend && npm run build
-# Outputs to frontend/dist/ — serve via Nginx above
+# Output: frontend/dist/  — serve via nginx.conf
 ```
 
 ---
 
 ## Security Notes
 
-1. **Change `JWT_SECRET`** in `.env` to a cryptographically random 64+ char string before deployment.
-2. **Never run the backend as root.** The `monitor` user + targeted sudoers is the right model.
-3. **HTTPS in production.** Add a TLS cert (Let's Encrypt via certbot) to the Nginx config.
-4. **Network-level access control.** Consider binding Nginx to the lab's internal network only (`listen 10.x.x.x:443`) so the dashboard is not internet-facing.
-5. **Rate limiting.** The built-in IP rate limiter is in-memory and resets on restart. For production, add `@fastify/rate-limit` backed by Redis.
-6. **Audit trail.** All kill operations are logged via `fastify.log.info(...)`. Pipe logs to a file or syslog with `LOG_LEVEL=info`.
-7. **dilab2 thermal monitoring**: Given the recent cooling system repair, the `gpuThermalCritical: true` flag on Node 2 causes all thermal alerts from that node to include a `⚠ POST-REPAIR` label, making them immediately distinguishable in the alert banner and thermal panel.
+1. **Change `JWT_SECRET`** in `.env` to a 64+ character random string before any production use
+2. **HTTPS in production** — add TLS via certbot; the terminal WebSocket carries live keystrokes
+3. **Network-level access** — bind Nginx to the lab's internal network only, not the public internet
+4. **`monitor` user is read-only** — it has no write access to user files; kill operations use `sudo kill` scoped to that binary only
+5. **Terminal sessions run as `monitor`** — not as the authenticated web user. For user-isolated terminals, configure tmux to `su` to the user inside the session
+6. **Rate limiting** — the built-in limiter is in-memory (resets on restart); for production use `@fastify/rate-limit` with Redis
+7. **dilab2 thermal flag** — `gpuThermalCritical: true` on node2 ensures all its GPU alerts carry a `⚠ POST-Repair` label, making them visually distinct from normal warnings
+8. **Audit trail** — all kill operations are logged: `[Kill] User oem killed PID 1234 on node2 with SIGTERM`. Pipe to syslog with `LOG_LEVEL=info`
+
+---
+
+## Terminal SSH Setup (per user)
+
+The terminal tab SSHes to `localhost:22` to launch tmux as the actual user.
+Each researcher needs their own SSH key authorized on dilab2:
+
+```bash
+# Each user runs this on dilab2 (once):
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""    # skip if key exists
+cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
+
+# Test it works:
+ssh -o StrictHostKeyChecking=no localhost "echo OK"
+```
+
+Alternatively the admin can run a script to set this up for all users:
+```bash
+for user in $(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1}'); do
+  home=$(eval echo ~$user)
+  sudo mkdir -p $home/.ssh
+  sudo -u $user ssh-keygen -t ed25519 -f $home/.ssh/id_ed25519 -N "" 2>/dev/null || true
+  sudo bash -c "cat $home/.ssh/id_ed25519.pub >> $home/.ssh/authorized_keys"
+  sudo chmod 700 $home/.ssh
+  sudo chmod 600 $home/.ssh/authorized_keys
+  sudo chown -R $user:$user $home/.ssh
+  echo "Done: $user"
+done
+```
+
+Also ensure `~/.ssh/authorized_keys` for the backend's SSH key is set:
+```bash
+# In backend .env — point to the user's own key (not the monitor key):
+# For local terminal, the backend will try SSH agent first, then this key
+SSH_KEY_PATH=/home/oem/.ssh/id_ed25519
+```
+
+#### log
+```bash
+sudo journalctl -u dilab-monitor -f
+```

@@ -3,14 +3,16 @@ import { useAuthStore } from '../../stores/authStore';
 import { useMetricsStore } from '../../stores/metricsStore';
 import {
   Cpu, Database, Layers, LogOut, Activity,
-  Wifi, WifiOff, ShieldAlert, Bell, ChevronRight
+  Wifi, WifiOff, ShieldAlert, Bell, ChevronRight, HardDrive, Terminal
 } from 'lucide-react';
 import { relativeTime } from '../../utils/format';
 
 const NAV = [
   { to: '/', label: 'Dashboard', icon: Activity, exact: true },
   { to: '/processes', label: 'Processes & GPU', icon: Cpu },
+  { to: '/storage', label: 'Storage', icon: HardDrive },
   { to: '/datasets', label: 'Dataset Hub', icon: Database },
+  { to: '/terminal', label: 'Terminal', icon: Terminal },
 ];
 
 export default function Layout() {

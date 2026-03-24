@@ -4,7 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import toast from 'react-hot-toast';
 import api from '../utils/api';
-import { useAuthStore } from '../stores/authStore';
+import { usePermissions } from '../hooks/usePermissions';
 import { formatBytes, relativeTime } from '../utils/format';
 import {
   Database, Plus, Tag, Search, ArrowRightLeft, Edit2, Trash2,
@@ -377,7 +377,7 @@ function DatasetCard({ dataset, allTags, canEdit, onEdit, onDelete, onSync }) {
 
 // ─── Main Datasets Page ────────────────────────────────────────────────────────
 export default function DatasetsPage() {
-  const { user } = useAuthStore();
+  const { can, isAdmin, username, user } = usePermissions();
   const queryClient = useQueryClient();
   const [search, setSearch] = useState('');
   const [activeTag, setActiveTag] = useState(null);
@@ -443,7 +443,7 @@ export default function DatasetsPage() {
     }
   };
 
-  const canEditDataset = (dataset) => user?.isAdmin || dataset.owner === user?.username;
+  const canEditDataset = (dataset) => can('dataset:edit', dataset.owner);
 
   return (
     <div className="p-6 space-y-5">

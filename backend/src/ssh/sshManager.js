@@ -1,13 +1,22 @@
 import { Client } from 'ssh2';
+import { exec, spawn } from 'child_process';
+import { promisify } from 'util';
+import { readFileSync } from 'fs';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
+const execLocal = promisify(exec);
+
 /**
- * SSH Connection Pool
- * Maintains persistent SSH connections to both lab nodes.
- * Automatically reconnects on failure with exponential backoff.
+ * NODE_LOCAL_ID = the node this backend process is physically running on.
+ * Commands for that node run via local child_process instead of SSH.
+ *
+ * If backend is hosted on dilab2.ssghu.ac.kr  →  NODE_LOCAL_ID=node2  (default)
+ * If backend is hosted on dilab.ssghu.ac.kr   →  NODE_LOCAL_ID=node1
+ * If backend is on a separate VM               →  NODE_LOCAL_ID=none
  */
+const LOCAL_NODE_ID = process.env.NODE_LOCAL_ID || 'node2';
 
 export const NODES = {
   node1: {
@@ -16,10 +25,6 @@ export const NODES = {
     host: process.env.NODE1_HOST || 'dilab.ssghu.ac.kr',
     port: parseInt(process.env.NODE1_SSH_PORT || '22'),
     username: process.env.SSH_USER || 'monitor',
-    privateKey: process.env.SSH_KEY_PATH
-      ? (await import('fs')).readFileSync(process.env.SSH_KEY_PATH)
-      : undefined,
-    password: process.env.NODE1_SSH_PASS,
     specs: {
       gpus: ['RTX 3090', 'RTX 3090'],
       cores: 18,
@@ -33,31 +38,47 @@ export const NODES = {
     host: process.env.NODE2_HOST || 'dilab2.ssghu.ac.kr',
     port: parseInt(process.env.NODE2_SSH_PORT || '22'),
     username: process.env.SSH_USER || 'monitor',
-    privateKey: process.env.SSH_KEY_PATH
-      ? (await import('fs')).readFileSync(process.env.SSH_KEY_PATH)
-      : undefined,
-    password: process.env.NODE2_SSH_PASS,
     specs: {
       gpus: ['RTX 4090', 'RTX 4090', 'RTX 4090', 'RTX 4090'],
       cores: 40,
       ramGB: 440,
-      // Node 2 recently had cooling repairs — thermal monitoring is mission-critical
-      gpuThermalCritical: true
+      gpuThermalCritical: true   // post-cooling repair — thermal priority
     }
   }
 };
 
-// Connection pool state
+// ─── Connection pool (SSH only — local node skips this) ────────────────────────
 const connections = new Map();
 const reconnectTimers = new Map();
 const MAX_RECONNECT_DELAY = 30000;
 
-/**
- * Create and store a persistent SSH connection for a node.
- */
+function isLocalNode(nodeId) {
+  return LOCAL_NODE_ID !== 'none' && LOCAL_NODE_ID === nodeId;
+}
+
+// Read SSH private key once at startup (only needed for remote nodes)
+function getSSHKey() {
+  if (!process.env.SSH_KEY_PATH) return undefined;
+  try {
+    return readFileSync(process.env.SSH_KEY_PATH);
+  } catch (e) {
+    console.error('[SSH] Could not read SSH key:', e.message);
+    return undefined;
+  }
+}
+
+const SSH_PRIVATE_KEY = getSSHKey();
+
 function createConnection(nodeId) {
   const nodeConfig = NODES[nodeId];
   if (!nodeConfig) throw new Error(`Unknown node: ${nodeId}`);
+
+  // Skip SSH for the local node
+  if (isLocalNode(nodeId)) {
+    connections.set(nodeId, { conn: null, status: 'local' });
+    console.log(`[SSH] ${nodeConfig.label} is LOCAL — skipping SSH`);
+    return Promise.resolve(null);
+  }
 
   return new Promise((resolve, reject) => {
     const conn = new Client();
@@ -93,10 +114,11 @@ function createConnection(nodeId) {
       keepaliveCountMax: 3
     };
 
-    if (nodeConfig.privateKey) {
-      connectConfig.privateKey = nodeConfig.privateKey;
-    } else if (nodeConfig.password) {
-      connectConfig.password = nodeConfig.password;
+    if (SSH_PRIVATE_KEY) {
+      connectConfig.privateKey = SSH_PRIVATE_KEY;
+    } else {
+      const passEnv = nodeId === 'node1' ? process.env.NODE1_SSH_PASS : process.env.NODE2_SSH_PASS;
+      if (passEnv) connectConfig.password = passEnv;
     }
 
     conn.connect(connectConfig);
@@ -111,6 +133,7 @@ function clearReconnectTimer(nodeId) {
 }
 
 function scheduleReconnect(nodeId) {
+  if (isLocalNode(nodeId)) return;
   clearReconnectTimer(nodeId);
   const state = connections.get(nodeId);
   const attempts = state?.reconnectAttempts || 0;
@@ -119,36 +142,44 @@ function scheduleReconnect(nodeId) {
   console.log(`[SSH] Reconnecting to ${nodeId} in ${delay}ms (attempt ${attempts + 1})`);
   const timer = setTimeout(async () => {
     connections.set(nodeId, { conn: null, status: 'reconnecting', reconnectAttempts: attempts + 1 });
-    try {
-      await createConnection(nodeId);
-    } catch (err) {
-      console.error(`[SSH] Reconnect failed for ${nodeId}:`, err.message);
-    }
+    try { await createConnection(nodeId); }
+    catch (err) { console.error(`[SSH] Reconnect failed for ${nodeId}:`, err.message); }
   }, delay);
   reconnectTimers.set(nodeId, timer);
 }
 
-/**
- * Initialize SSH connections to all nodes.
- */
+// ─── Public API ────────────────────────────────────────────────────────────────
+
 export async function initSSHConnections() {
-  console.log('[SSH] Initializing connections to all nodes...');
+  console.log(`[SSH] Initializing connections (local node: ${LOCAL_NODE_ID})...`);
   const results = await Promise.allSettled(
     Object.keys(NODES).map(nodeId => createConnection(nodeId))
   );
   results.forEach((result, i) => {
     const nodeId = Object.keys(NODES)[i];
     if (result.status === 'rejected') {
-      console.error(`[SSH] Initial connection to ${nodeId} failed:`, result.reason.message);
+      console.error(`[SSH] Initial connection to ${nodeId} failed:`, result.reason?.message);
     }
   });
 }
 
 /**
- * Execute a command on a specific node via SSH.
- * Returns stdout as string.
+ * Execute a command on a node.
+ * - Local node  → child_process.exec (no SSH overhead)
+ * - Remote node → persistent SSH connection
  */
 export function execOnNode(nodeId, command, timeoutMs = 15000) {
+  // ── Local execution ──────────────────────────────────────────────────────
+  if (isLocalNode(nodeId)) {
+    return execLocal(command, { timeout: timeoutMs })
+      .then(({ stdout }) => stdout.trim())
+      .catch(err => {
+        if (err.stdout) return err.stdout.trim();
+        throw new Error(err.message);
+      });
+  }
+
+  // ── Remote SSH execution ─────────────────────────────────────────────────
   return new Promise((resolve, reject) => {
     const state = connections.get(nodeId);
     if (!state?.conn) {
@@ -164,29 +195,20 @@ export function execOnNode(nodeId, command, timeoutMs = 15000) {
 
       const timer = setTimeout(() => {
         stream.destroy();
-        reject(new Error(`Command timed out after ${timeoutMs}ms: ${command}`));
+        reject(new Error(`Command timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
-      stream
-        .on('data', (data) => { output += data.toString(); })
-        .stderr.on('data', (data) => { errOutput += data.toString(); });
-
-      stream.on('close', (code) => {
+      stream.on('data', d => { output += d.toString(); });
+      stream.stderr.on('data', d => { errOutput += d.toString(); });
+      stream.on('close', code => {
         clearTimeout(timer);
-        if (code !== 0 && !output) {
-          reject(new Error(`Command failed (exit ${code}): ${errOutput || 'no output'}`));
-        } else {
-          resolve(output.trim());
-        }
+        if (code !== 0 && !output) reject(new Error(`Exit ${code}: ${errOutput}`));
+        else resolve(output.trim());
       });
     });
   });
 }
 
-/**
- * Execute a command on ALL nodes concurrently.
- * Returns object: { node1: result|error, node2: result|error }
- */
 export async function execOnAllNodes(command, timeoutMs = 15000) {
   const results = await Promise.allSettled(
     Object.keys(NODES).map(nodeId => execOnNode(nodeId, command, timeoutMs))
@@ -196,20 +218,18 @@ export async function execOnAllNodes(command, timeoutMs = 15000) {
       nodeId,
       results[i].status === 'fulfilled'
         ? { success: true, data: results[i].value }
-        : { success: false, error: results[i].reason.message }
+        : { success: false, error: results[i].reason?.message }
     ])
   );
 }
 
-/**
- * Get the current connection status of all nodes.
- */
 export function getConnectionStatus() {
   return Object.fromEntries(
     Object.keys(NODES).map(nodeId => {
       const state = connections.get(nodeId);
       return [nodeId, {
         status: state?.status || 'unknown',
+        isLocal: isLocalNode(nodeId),
         error: state?.error || null,
         label: NODES[nodeId].label,
         specs: NODES[nodeId].specs
@@ -219,25 +239,29 @@ export function getConnectionStatus() {
 }
 
 /**
- * Execute a long-running command (like rsync) with streaming output.
- * Calls onData(chunk) for each output chunk, resolves when done.
+ * Stream a long-running command (e.g. rsync) with live output callbacks.
  */
 export function execStreamOnNode(nodeId, command, onData, onError) {
+  // ── Local stream ─────────────────────────────────────────────────────────
+  if (isLocalNode(nodeId)) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(command, { shell: true });
+      child.stdout.on('data', d => onData(d.toString()));
+      child.stderr.on('data', d => onError?.(d.toString()));
+      child.on('close', code => code === 0 ? resolve() : reject(new Error(`Exit ${code}`)));
+    });
+  }
+
+  // ── Remote SSH stream ────────────────────────────────────────────────────
   return new Promise((resolve, reject) => {
     const state = connections.get(nodeId);
-    if (!state?.conn) {
-      return reject(new Error(`No active SSH connection to ${nodeId}`));
-    }
+    if (!state?.conn) return reject(new Error(`No SSH connection to ${nodeId}`));
 
     state.conn.exec(command, (err, stream) => {
       if (err) return reject(err);
-
-      stream.on('data', (data) => onData(data.toString()));
-      stream.stderr.on('data', (data) => onError?.(data.toString()));
-      stream.on('close', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`Command exited with code ${code}`));
-      });
+      stream.on('data', d => onData(d.toString()));
+      stream.stderr.on('data', d => onError?.(d.toString()));
+      stream.on('close', code => code === 0 ? resolve() : reject(new Error(`Exit ${code}`)));
     });
   });
 }
