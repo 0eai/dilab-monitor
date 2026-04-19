@@ -1,9 +1,9 @@
-# DILab Server Monitor
+# Node Monitor
 
-> **Full-stack server management and monitoring platform for the DILab AI Research Lab.**
+> **Full-stack server management and monitoring platform for multi-node environments.**
 > Real-time GPU thermals, VRAM zombie detection, tmux terminal, per-user resource tracking,
 > open ports, SSH sessions, storage analytics, and a collaborative dataset hub —
-> across both Ubuntu 22.04 nodes via live WebSocket streaming.
+> across multiple Linux nodes via live WebSocket streaming.
 
 ---
 
@@ -27,14 +27,14 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Browser (Researcher)                        │
+│                     Browser (User)                              │
 │  React 18 + Vite + Tailwind  ·  Zustand  ·  TanStack Query     │
 │  xterm.js (terminal)  ·  Recharts  ·  WebSocket (live metrics)  │
 └──────────────────────────────┬──────────────────────────────────┘
                                │ HTTP + WebSocket
 ┌──────────────────────────────▼──────────────────────────────────┐
 │                  Node.js Backend  (Fastify)                     │
-│                  Hosted on dilab2.ssghu.ac.kr                   │
+│                  Hosted on one of your nodes                    │
 │                                                                 │
 │  /api/auth        ── PAM/shadow auth → JWT (8h TTL)            │
 │  /api/monitoring  ── Cached snapshots + historical ring buf     │
@@ -47,23 +47,19 @@
 │  node-cron (5s) ──► SSH Manager ──► MetricsCache ──► WS push   │
 │                                                                 │
 └───────────────┬──────────────────────────┬──────────────────────┘
-                │ SSH (ssh2) port 2222      │ local child_process
-                │                          │ (NODE_LOCAL_ID=node2)
+                │ SSH (ssh2) or local exec │
 ┌───────────────▼──────────┐  ┌────────────▼────────────────────┐
-│   dilab (Node 1)         │  │   dilab2 (Node 2) — LOCAL       │
-│   dilab.ssu.ac.kr:2222   │  │   dilab2.ssghu.ac.kr            │
-│   2× RTX 3090            │  │   4× RTX 4090                   │
-│   18 cores / 251 GB RAM  │  │   40 cores / 440 GB RAM         │
-│                          │  │   ⚠ Post-cooling repair:        │
-│   monitor user (SSH)     │  │     thermal priority active     │
+│   Node 1                 │  │   Node 2 (can be LOCAL)         │
+│   (configurable host)    │  │   (configurable host)           │
+│   SSH monitoring         │  │   SSH or local child_process    │
 └──────────────────────────┘  └─────────────────────────────────┘
 ```
 
 **Data flow for live metrics:**
 1. `node-cron` fires every 5 seconds
-2. Scheduler fetches both nodes **concurrently** via `Promise.allSettled`
-3. dilab2 runs commands via local `child_process.exec` (zero SSH overhead)
-4. dilab runs commands over the persistent SSH connection
+2. Scheduler fetches all nodes **concurrently** via `Promise.allSettled`
+3. Local node (if `NODE_LOCAL_ID` is set) runs commands via `child_process.exec` (zero SSH overhead)
+4. Remote nodes run commands over persistent SSH connections
 5. Parsed data stored in `MetricsCache` (360-entry ring buffer = 30 min history)
 6. Broadcast to all connected WebSocket clients atomically
 
@@ -72,7 +68,7 @@
 ## Directory Structure
 
 ```
-dilab-monitor/
+node-monitor/
 ├── README.md
 ├── backend/
 │   ├── .env.example
@@ -161,7 +157,7 @@ dilab-monitor/
 ### Prerequisites
 
 ```bash
-# On dilab2 (backend host):
+# On the backend host node:
 sudo apt install -y libpam-dev build-essential pamtester sshpass tmux
 pip install crypt-r           # Python 3.13+ yescrypt support
 
@@ -169,8 +165,8 @@ pip install crypt-r           # Python 3.13+ yescrypt support
 sudo usermod -aG shadow $USER
 exec su -l $USER              # apply without logout
 
-# Sudoers for monitoring commands (backend user on dilab2):
-cat << 'EOF' | sudo tee /etc/sudoers.d/dilab-monitor
+# Sudoers for monitoring commands (backend user on local node):
+cat << 'EOF' | sudo tee /etc/sudoers.d/node-monitor
 # Storage monitoring
 $USER ALL=(ALL) NOPASSWD: /usr/bin/du
 
@@ -179,40 +175,67 @@ $USER ALL=(ALL) NOPASSWD: /usr/bin/ss
 $USER ALL=(ALL) NOPASSWD: /usr/bin/netstat
 $USER ALL=(ALL) NOPASSWD: /usr/bin/ps
 EOF
-sudo chmod 440 /etc/sudoers.d/dilab-monitor
+sudo chmod 440 /etc/sudoers.d/node-monitor
 
-# On dilab (node1) — install tools the monitor user will run:
-sudo apt install -y lm-sensors nvidia-utils-535 tmux
+# On remote nodes — install tools the monitor user will run:
+sudo apt install -y lm-sensors nvidia-utils tmux
 sudo sensors-detect --auto
 ```
 
 ### 1. Clone & configure
 
 ```bash
-git clone <repo> dilab-monitor && cd dilab-monitor
+git clone https://github.com/yourusername/node-monitor.git
+cd node-monitor
 cp backend/.env.example backend/.env
-nano backend/.env   # set JWT_SECRET, SSH_KEY_PATH, NODE_LOCAL_ID=node2
+nano backend/.env   # Configure all settings (see below)
 ```
 
-### 2. SSH key setup (for dilab / node1 only)
+**Key environment variables to configure:**
 
 ```bash
-# Generate key on dilab2:
-ssh-keygen -t ed25519 -C "dilab-monitor" -f ~/.ssh/dilab_monitor -N ""
+# Application
+APP_NAME="Node Monitor"
+APP_SHORT_NAME="Nodes"
 
-# Copy to dilab via your own account:
-ssh -p 2222 yourname@dilab.ssu.ac.kr
-sudo mkdir -p /home/monitor/.ssh
-sudo bash -c 'cat >> /home/monitor/.ssh/authorized_keys' << 'KEY'
-PASTE_CONTENT_OF_~/.ssh/dilab_monitor.pub_HERE
-KEY
-sudo chmod 700 /home/monitor/.ssh
-sudo chmod 600 /home/monitor/.ssh/authorized_keys
-sudo chown -R monitor:monitor /home/monitor/.ssh
-sudo usermod -s /bin/bash monitor
+# Server
+PORT=3001
+DOMAIN_NAME=your-domain.com
+
+# Security
+JWT_SECRET=change-me-to-a-long-random-secret-at-least-64-chars
+
+# Local Node
+NODE_LOCAL_ID=node2  # or node1, or none if backend is on separate machine
+
+# SSH Configuration
+SSH_USER=monitor
+SSH_KEY_PATH=/home/monitor/.ssh/id_ed25519
+
+# Node Configuration
+NODE1_HOST=node1.example.com
+NODE1_LABEL=Server-01
+NODE1_SSH_PORT=22
+
+NODE2_HOST=node2.example.com
+NODE2_LABEL=Server-02
+NODE2_SSH_PORT=22
+
+# Database
+DB_PATH=./data/node-monitor.db
+```
+
+### 2. SSH key setup (for remote nodes)
+
+```bash
+# Generate key on backend host:
+ssh-keygen -t ed25519 -C "node-monitor" -f ~/.ssh/node_monitor -N ""
+
+# Copy to remote node:
+ssh-copy-id -i ~/.ssh/node_monitor.pub -p 22 monitor@node1.example.com
 
 # Test:
-ssh -i ~/.ssh/dilab_monitor -p 2222 monitor@dilab.ssu.ac.kr "whoami"
+ssh -i ~/.ssh/node_monitor -p 22 monitor@node1.example.com "whoami"
 ```
 
 ### 3. Install & run
@@ -228,7 +251,7 @@ cd frontend && npm install && npm run dev
 
 ### 4. Login
 
-Use any Linux system account on dilab2. Admin access is granted automatically for users in the `sudo` group.
+Use any Linux system account from any monitored node. Admin access is granted automatically for users in the `sudo` group.
 
 ---
 
@@ -248,8 +271,8 @@ Browser                    Backend                      Linux OS
   │                           │    crypt.crypt(pass, hash)  │
   │                           │    supports yescrypt $y$    │
   │                           │                             │
-  │                           │  NO → sshpass SSH to node1  │
-  │                           │    ssh user@dilab.ssu.ac.kr │
+  │                           │  NO → sshpass SSH to nodes  │
+  │                           │    tries each configured node│
   │                           │    runs `id` command        │
   │                           │                             │
   │                           │  jwt.sign({                 │
@@ -291,71 +314,6 @@ All access control flows through a **single hook** on the frontend and **decorat
 | Attach to **any** tmux session | ❌ | ✅ | `isAdmin` check in `terminalRoutes.js` |
 | Create named tmux session | ❌ | ✅ | `isAdmin` check in `terminalRoutes.js` |
 
-### Frontend enforcement — `usePermissions` hook
-
-All UI gating flows through `src/hooks/usePermissions.js`:
-
-```js
-import { usePermissions } from '../hooks/usePermissions';
-
-function MyComponent({ process }) {
-  const { can } = usePermissions();
-
-  return (
-    <>
-      {/* Visible to everyone */}
-      <ProcessInfo proc={process} />
-
-      {/* Only shown if user owns it OR is admin */}
-      {can('kill:own', process.user) && <KillButton proc={process} />}
-
-      {/* Only shown to admins */}
-      {can('kill:any') && <ForceKillAllButton />}
-    </>
-  );
-}
-```
-
-### Backend enforcement — Fastify decorators
-
-```js
-// Require any valid JWT:
-fastify.addHook('onRequest', fastify.authenticate);
-
-// Require admin (isAdmin: true in JWT):
-fastify.addHook('onRequest', fastify.requireAdmin);
-
-// Require ownership OR admin (in route handler):
-if (resource.owner !== request.user.username && !request.user.isAdmin) {
-  return reply.status(403).send({ error: 'Forbidden' });
-}
-```
-
-### Adding a new permission level
-
-To add a "Lab Manager" role (can kill processes but not manage all datasets):
-
-**1. Add the group check in `pamAuth.js`:**
-```js
-const isLabManager = groupsList.includes('labmanager');
-// Add to JWT payload:
-return { username, isAdmin, isLabManager, groups, ... };
-```
-
-**2. Add to `usePermissions.js`:**
-```js
-const isLabManager = user?.isLabManager ?? false;
-
-case 'kill:any':
-  return isAdmin || isLabManager;  // lab managers can also kill processes
-```
-
-**3. Create the Linux group on both servers:**
-```bash
-sudo groupadd labmanager
-sudo usermod -aG labmanager username
-```
-
 ---
 
 ## Adding & Removing Nodes
@@ -374,15 +332,15 @@ export const NODES = {
   // ADD THIS:
   node3: {
     id: 'node3',
-    label: 'dilab3 (Node 3)',
-    host: process.env.NODE3_HOST || 'dilab3.ssu.ac.kr',
+    label: process.env.NODE3_LABEL || 'Node 3',
+    host: process.env.NODE3_HOST || 'node3.example.com',
     port: parseInt(process.env.NODE3_SSH_PORT || '22'),
     username: process.env.SSH_USER || 'monitor',
     specs: {
       gpus: ['RTX 4090', 'RTX 4090'],
       cores: 32,
       ramGB: 256,
-      gpuThermalCritical: false  // set true if post-repair thermal monitoring needed
+      gpuThermalCritical: false
     }
   }
 };
@@ -391,49 +349,27 @@ export const NODES = {
 **Step 2 — `backend/.env`**: add host variables:
 
 ```bash
-NODE3_HOST=dilab3.ssu.ac.kr
+NODE3_HOST=node3.example.com
+NODE3_LABEL=Server-03
 NODE3_SSH_PORT=22
-# No SSH_PASS needed if using key auth (recommended)
 ```
 
-**Step 3 — Set up the `monitor` user on the new server** (same as dilab node1 setup above).
+**Step 3 — Set up the `monitor` user on the new server** (same as other nodes).
 
 **Step 4 — Copy SSH public key** to the new server:
 ```bash
-ssh-copy-id -i ~/.ssh/dilab_monitor.pub -p 22 monitor@dilab3.ssu.ac.kr
+ssh-copy-id -i ~/.ssh/node_monitor.pub -p 22 monitor@node3.example.com
 ```
 
-**That's it.** Everything else reads `Object.keys(NODES)` dynamically:
-- SSH manager creates connections for all nodes automatically
-- Scheduler polls all nodes concurrently
-- REST endpoints accept any valid `nodeId` from the registry
-- Frontend `NodeCard`, `ThermalPanel`, `StoragePanel` all accept `nodeId` as a prop
-
-**For the frontend**, update `DashboardPage.jsx` to loop over nodes rather than hardcoding:
-
-```jsx
-// Instead of hardcoding node1/node2, read from a config:
-const NODES = [
-  { id: 'node1', label: 'dilab' },
-  { id: 'node2', label: 'dilab2', missionCritical: true },
-  { id: 'node3', label: 'dilab3' },  // ← add here
-];
-
-// Then render dynamically:
-{NODES.map(node => (
-  <NodeCard key={node.id} nodeId={node.id} nodeData={metrics?.[node.id]} />
-))}
-```
+**That's it.** Everything else reads `Object.keys(NODES)` dynamically.
 
 ### Removing a node
 
 **Step 1** — Delete the entry from `NODES` in `sshManager.js`.
 
-**Step 2** — Remove the corresponding `NODE3_HOST` / `NODE3_SSH_PORT` lines from `.env`.
+**Step 2** — Remove the corresponding env variables from `.env`.
 
-**Step 3** — Remove the node from `DashboardPage.jsx`'s `NODES` array if hardcoded.
-
-Restart the backend — the removed node will no longer appear anywhere in the UI.
+Restart the backend — the removed node will no longer appear.
 
 ### Setting a node as "local" (no SSH)
 
@@ -452,13 +388,13 @@ That node will use `child_process.exec` instead of SSH — no `monitor` user nee
 
 | Panel | What it shows | Refresh |
 |-------|--------------|---------|
-| **Alert Banner** | Flashing critical GPU/RAM alerts with post-repair badge for dilab2 | 5s (WS) |
+| **Alert Banner** | Flashing critical GPU/RAM alerts | 5s (WS) |
 | **Node Cards** | CPU%, RAM%, per-GPU temp/VRAM/util, load avg, mini sparklines | 5s (WS) |
 | **Thermal Panels** | Arc gauges per GPU, temp history sparklines, CPU core grid | 5s (WS) |
-| **Storage Panels** | Filesystems with NVMe/SATA distinction, usage bars | 5s (WS) |
+| **Storage Panels** | Filesystems with usage bars | 5s (WS) |
 | **SSH Sessions** | Active sessions per node + recent login history | 15s |
-| **Open Ports** | Listening ports with process, PID, user, bind address (requires sudo for full info) | 30s |
-| **User Resource Table** | Every researcher's CPU, RAM, VRAM across both nodes | 5s (WS) |
+| **Open Ports** | Listening ports with process, PID, user (requires sudo) | 30s |
+| **User Resource Table** | Every user's CPU, RAM, VRAM across all nodes | 5s (WS) |
 
 ### Processes & GPU (`/processes`)
 
@@ -475,9 +411,9 @@ That node will use `child_process.exec` instead of SSH — no `monitor` user nee
 
 | Tab | Detail |
 |-----|--------|
-| Overview | All filesystems per node, NVMe badge, used/free/total |
+| Overview | All filesystems per node, used/free/total |
 | Per-User Usage | `sudo du` ranked list with hover mount breakdown |
-| Comparison | Stacked bar chart — both nodes side by side per user |
+| Comparison | Stacked bar chart — all nodes side by side per user |
 
 ### Terminal (`/terminal`)
 
@@ -485,7 +421,7 @@ That node will use `child_process.exec` instead of SSH — no `monitor` user nee
 |---------|--------|
 | tmux bridge | xterm.js → WebSocket → SSH PTY → tmux attach |
 | Multi-tab | Open multiple sessions simultaneously |
-| Node selector | Switch between dilab and dilab2 |
+| Node selector | Switch between configured nodes |
 | Session picker | List active sessions, create new ones |
 | Permission | Standard users: own session only. Admins: any session |
 | Resize | Terminal resizes automatically with the window |
@@ -504,11 +440,11 @@ That node will use `child_process.exec` instead of SSH — no `monitor` user nee
 ## SSH Monitor User Setup
 
 ```bash
-# On dilab (node1) — create limited monitor account:
+# On each node — create limited monitor account:
 sudo useradd -r -m -s /bin/bash monitor
 
 # Allow specific commands without password:
-cat << 'EOF' | sudo tee /etc/sudoers.d/dilab-monitor
+cat << 'EOF' | sudo tee /etc/sudoers.d/node-monitor
 # System monitoring
 monitor ALL=(ALL) NOPASSWD: /usr/bin/sensors
 monitor ALL=(ALL) NOPASSWD: /usr/bin/du
@@ -521,10 +457,10 @@ monitor ALL=(ALL) NOPASSWD: /usr/bin/ps
 # Process management
 monitor ALL=(ALL) NOPASSWD: /bin/kill
 EOF
-sudo chmod 440 /etc/sudoers.d/dilab-monitor
+sudo chmod 440 /etc/sudoers.d/node-monitor
 ```
 
-**Important:** The port monitoring feature requires `ss`, `netstat`, and `ps` with sudo privileges. Without these, the Open Ports display can only show process/user information for ports owned by the monitor user. With sudo configured, all ports will show actual process names and usernames.
+**Important:** The port monitoring feature requires `ss`, `netstat`, and `ps` with sudo privileges. Without these, the Open Ports display can only show process/user information for ports owned by the monitor user.
 
 ---
 
@@ -533,64 +469,78 @@ sudo chmod 440 /etc/sudoers.d/dilab-monitor
 ### Systemd service
 
 ```ini
-# /etc/systemd/system/dilab-monitor.service
+# /etc/systemd/system/node-monitor.service
 [Unit]
-Description=DILab Server Monitor Backend
+Description=Node Monitor Backend
 After=network.target
 
 [Service]
 Type=simple
-User=oem
-WorkingDirectory=/opt/dilab-monitor/backend
+User=yourusername
+WorkingDirectory=/path/to/node-monitor/backend
 ExecStart=/usr/bin/node src/index.js
 Restart=always
 RestartSec=5
-EnvironmentFile=/opt/dilab-monitor/backend/.env
+EnvironmentFile=/path/to/node-monitor/backend/.env
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl enable --now dilab-monitor
+sudo systemctl enable --now node-monitor
 ```
 
 ### Nginx reverse proxy
 
-```nginx
-server {
-    listen 80;
-    server_name monitor.dilab.ssu.ac.kr;
+We provide example configurations to get you started:
 
-    # Frontend static build
-    location / {
-        root /opt/dilab-monitor/frontend/dist;
-        try_files $uri $uri/ /index.html;
-    }
+- **[nginx.conf.example](nginx.conf.example)** - Template with `CHANGE_THIS` placeholders
+- **[nginx.conf.filled-example](nginx.conf.filled-example)** - Reference showing completed configuration
 
-    # API
-    location /api/ {
-        proxy_pass http://localhost:3001;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
+**Quick setup:**
 
-    # WebSocket (metrics stream + terminal)
-    location ~ ^/(ws|api/terminal)/ {
-        proxy_pass http://localhost:3001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_read_timeout 3600s;   # keep terminal WS alive
-    }
-}
+```bash
+# Copy the example template
+cp nginx.conf.example nginx.conf
+
+# Edit and replace all CHANGE_THIS placeholders
+nano nginx.conf
+
+# Deploy to nginx
+sudo cp nginx.conf /etc/nginx/sites-available/node-monitor
+sudo ln -s /etc/nginx/sites-available/node-monitor /etc/nginx/sites-enabled/
+
+# Get SSL certificate (certbot will update the paths automatically)
+sudo certbot --nginx -d your-domain.com
+
+# Test and reload
+sudo nginx -t && sudo systemctl reload nginx
 ```
+
+**Key configuration points:**
+1. Update `server_name` to your domain (2 places)
+2. Update SSL certificate paths (certbot does this automatically)
+3. Update `root` path to your frontend build directory
+4. Adjust backend port in `upstream` block if not using 3001
 
 ### Frontend build
 
 ```bash
 cd frontend && npm run build
-# Output: frontend/dist/  — serve via nginx.conf
+# Output: frontend/dist/  — serve via nginx
+```
+
+### Deployment script
+
+Use the included [deploy.sh](deploy.sh) script with environment variables:
+
+```bash
+APP_DIR=~/node-monitor \
+WEB_ROOT=/var/www/node-monitor \
+SERVICE_NAME=node-monitor \
+DOMAIN=your-domain.com \
+./deploy.sh
 ```
 
 ---
@@ -599,55 +549,11 @@ cd frontend && npm run build
 
 1. **Change `JWT_SECRET`** in `.env` to a 64+ character random string before any production use
 2. **HTTPS in production** — add TLS via certbot; the terminal WebSocket carries live keystrokes
-3. **Network-level access** — bind Nginx to the lab's internal network only, not the public internet
+3. **Network-level access** — bind Nginx to internal network only, not the public internet
 4. **`monitor` user is read-only** — it has no write access to user files; kill operations use `sudo kill` scoped to that binary only
 5. **Terminal sessions run as `monitor`** — not as the authenticated web user. For user-isolated terminals, configure tmux to `su` to the user inside the session
 6. **Rate limiting** — the built-in limiter is in-memory (resets on restart); for production use `@fastify/rate-limit` with Redis
-7. **dilab2 thermal flag** — `gpuThermalCritical: true` on node2 ensures all its GPU alerts carry a `⚠ POST-Repair` label, making them visually distinct from normal warnings
-8. **Audit trail** — all kill operations are logged: `[Kill] User oem killed PID 1234 on node2 with SIGTERM`. Pipe to syslog with `LOG_LEVEL=info`
-
----
-
-## Terminal SSH Setup (per user)
-
-The terminal tab SSHes to `localhost:22` to launch tmux as the actual user.
-Each researcher needs their own SSH key authorized on dilab2:
-
-```bash
-# Each user runs this on dilab2 (once):
-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""    # skip if key exists
-cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
-chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
-
-# Test it works:
-ssh -o StrictHostKeyChecking=no localhost "echo OK"
-```
-
-Alternatively the admin can run a script to set this up for all users:
-```bash
-for user in $(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1}'); do
-  home=$(eval echo ~$user)
-  sudo mkdir -p $home/.ssh
-  sudo -u $user ssh-keygen -t ed25519 -f $home/.ssh/id_ed25519 -N "" 2>/dev/null || true
-  sudo bash -c "cat $home/.ssh/id_ed25519.pub >> $home/.ssh/authorized_keys"
-  sudo chmod 700 $home/.ssh
-  sudo chmod 600 $home/.ssh/authorized_keys
-  sudo chown -R $user:$user $home/.ssh
-  echo "Done: $user"
-done
-```
-
-Also ensure `~/.ssh/authorized_keys` for the backend's SSH key is set:
-```bash
-# In backend .env — point to the user's own key (not the monitor key):
-# For local terminal, the backend will try SSH agent first, then this key
-SSH_KEY_PATH=/home/oem/.ssh/id_ed25519
-```
-
-#### log
-```bash
-sudo journalctl -u dilab-monitor -f
-```
+7. **Audit trail** — all kill operations are logged with username, PID, and signal. Pipe to syslog with `LOG_LEVEL=info`
 
 ---
 
@@ -657,49 +563,49 @@ sudo journalctl -u dilab-monitor -f
 
 **Symptom:** The Open Ports page shows "unknown" in the Process and User columns for most ports.
 
-**Cause:** The monitoring user (or backend user on local node) doesn't have sudo privileges to run `ss`, `ps`, and `netstat`.
+**Cause:** The monitoring user doesn't have sudo privileges to run `ss`, `ps`, and `netstat`.
 
 **Solution:**
 
 1. **Verify sudo configuration exists:**
    ```bash
-   # On dilab2 (as the backend user, e.g., oem):
+   # On backend host:
    sudo -l | grep -E "ss|ps|netstat"
 
-   # On dilab (as monitor user):
-   ssh -p 2222 monitor@dilab.ssu.ac.kr "sudo -l | grep -E 'ss|ps|netstat'"
+   # On remote nodes:
+   ssh monitor@node1.example.com "sudo -l | grep -E 'ss|ps|netstat'"
    ```
 
 2. **If missing, add sudo permissions:**
    ```bash
-   # On each node, create/update /etc/sudoers.d/dilab-monitor:
-   sudo visudo -f /etc/sudoers.d/dilab-monitor
+   # On each node, create/update /etc/sudoers.d/node-monitor:
+   sudo visudo -f /etc/sudoers.d/node-monitor
 
-   # Add these lines (replace $USER with actual username):
-   <username> ALL=(ALL) NOPASSWD: /usr/bin/ss
-   <username> ALL=(ALL) NOPASSWD: /usr/bin/netstat
-   <username> ALL=(ALL) NOPASSWD: /usr/bin/ps
+   # Add these lines (replace monitor with actual username):
+   monitor ALL=(ALL) NOPASSWD: /usr/bin/ss
+   monitor ALL=(ALL) NOPASSWD: /usr/bin/netstat
+   monitor ALL=(ALL) NOPASSWD: /usr/bin/ps
    ```
 
 3. **Test sudo commands work without password:**
    ```bash
    sudo -n ss -tlnpH | head -3
-   sudo -n ps -o pid=,user= -p 1
+   sudo -n ps -o pid=,user= -p $$
    ```
-
-   Should show output, NOT "sudo: a password is required"
 
 4. **Restart backend** (if running as a service):
    ```bash
-   sudo systemctl restart dilab-monitor
+   sudo systemctl restart node-monitor
    ```
 
-**Expected behavior after fix:**
-- Process column: Shows actual process names (nginx, sshd, redis-server, etc.)
-- PID column: Shows actual process IDs (numbers, not "–")
-- User column: Shows actual usernames (root, www-data, username, etc.)
+---
 
-**Fallback behavior without sudo:**
-- Only ports owned by the monitoring user will show process/user info
-- Ports owned by other users will show "unknown"
-- The system still works, just with limited information
+## License
+
+MIT
+
+---
+
+## Contributing
+
+Contributions welcome! Please open an issue or PR.

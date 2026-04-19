@@ -2,13 +2,10 @@
 set -e
 
 # Configuration - update these for your deployment
-# Get the directory where this script is located
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-
-APP_DIR="${APP_DIR:-$SCRIPT_DIR}"
-WEB_ROOT="${WEB_ROOT:-/var/www/dilab-monitor}"
-SERVICE_NAME="${SERVICE_NAME:-dilab-monitor}"
-DOMAIN="${DOMAIN:-dilab2.ssu.ac.kr}"
+APP_DIR="${APP_DIR:-~/node-monitor}"
+WEB_ROOT="${WEB_ROOT:-/var/www/node-monitor}"
+SERVICE_NAME="${SERVICE_NAME:-node-monitor}"
+DOMAIN="${DOMAIN:-your-domain.com}"
 
 echo "Building frontend..."
 cd "$APP_DIR/frontend" && npm run build

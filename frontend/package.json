@@ -1,7 +1,7 @@
 {
-  "name": "dilab-monitor-frontend",
+  "name": "node-monitor-frontend",
   "version": "1.0.0",
-  "description": "DILab Server Management & Monitoring Frontend",
+  "description": "Multi-Node Server Management & Monitoring Frontend",
   "type": "module",
   "scripts": {
     "dev": "vite",

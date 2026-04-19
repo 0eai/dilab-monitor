@@ -106,17 +106,10 @@ export default function LoginPage() {
           </form>
         </div>
 
-        {/* Node status footer */}
-        <div className="mt-4 flex items-center justify-center gap-4 text-xs text-slate-600">
-          <div className="flex items-center gap-1.5">
-            <Server size={11} />
-            <span>dilab.ssghu.ac.kr</span>
-          </div>
-          <span>·</span>
-          <div className="flex items-center gap-1.5">
-            <Server size={11} />
-            <span>dilab2.ssghu.ac.kr</span>
-          </div>
+        {/* Authentication info footer */}
+        <div className="mt-4 flex items-center justify-center gap-2 text-xs text-slate-600">
+          <Server size={11} />
+          <span>Multi-Node Server Monitoring</span>
         </div>
         <p className="text-center text-xs text-slate-700 mt-2">
           Authenticated via Linux PAM · Access mirrors system privileges

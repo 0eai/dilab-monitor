@@ -35,8 +35,8 @@ export default function Layout() {
               <Layers size={16} className="text-accent" />
             </div>
             <div>
-              <div className="font-display font-semibold text-sm text-slate-100">DILab</div>
-              <div className="text-[10px] text-slate-500 font-mono">Monitor v1.0</div>
+              <div className="font-display font-semibold text-sm text-slate-100">Node Monitor</div>
+              <div className="text-[10px] text-slate-500 font-mono">v1.0</div>
             </div>
           </div>
         </div>
@@ -45,7 +45,7 @@ export default function Layout() {
         <div className="px-3 pt-3 space-y-1">
           {['node1', 'node2'].map(nodeId => {
             const node = metrics?.[nodeId];
-            const label = nodeId === 'node1' ? 'dilab' : 'dilab2';
+            const label = node?.label || nodeId;
             const hasError = !node || !!node.error;
             const isMissionCritical = nodeId === 'node2';
             return (

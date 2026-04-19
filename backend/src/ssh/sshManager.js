@@ -12,17 +12,17 @@ const execLocal = promisify(exec);
  * NODE_LOCAL_ID = the node this backend process is physically running on.
  * Commands for that node run via local child_process instead of SSH.
  *
- * If backend is hosted on dilab2.ssghu.ac.kr  →  NODE_LOCAL_ID=node2  (default)
- * If backend is hosted on dilab.ssghu.ac.kr   →  NODE_LOCAL_ID=node1
- * If backend is on a separate VM               →  NODE_LOCAL_ID=none
+ * If backend is hosted on node2  →  NODE_LOCAL_ID=node2  (default)
+ * If backend is hosted on node1  →  NODE_LOCAL_ID=node1
+ * If backend is on a separate VM →  NODE_LOCAL_ID=none
  */
 const LOCAL_NODE_ID = process.env.NODE_LOCAL_ID || 'node2';
 
 export const NODES = {
   node1: {
     id: 'node1',
-    label: 'dilab (Node 1)',
-    host: process.env.NODE1_HOST || 'dilab.ssghu.ac.kr',
+    label: process.env.NODE1_LABEL || 'Node 1',
+    host: process.env.NODE1_HOST || 'node1.example.com',
     port: parseInt(process.env.NODE1_SSH_PORT || '22'),
     username: process.env.SSH_USER || 'monitor',
     specs: {
@@ -34,15 +34,15 @@ export const NODES = {
   },
   node2: {
     id: 'node2',
-    label: 'dilab2 (Node 2)',
-    host: process.env.NODE2_HOST || 'dilab2.ssghu.ac.kr',
+    label: process.env.NODE2_LABEL || 'Node 2',
+    host: process.env.NODE2_HOST || 'node2.example.com',
     port: parseInt(process.env.NODE2_SSH_PORT || '22'),
     username: process.env.SSH_USER || 'monitor',
     specs: {
       gpus: ['RTX 4090', 'RTX 4090', 'RTX 4090', 'RTX 4090'],
       cores: 40,
       ramGB: 440,
-      gpuThermalCritical: true   // post-cooling repair — thermal priority
+      gpuThermalCritical: false
     }
   }
 };

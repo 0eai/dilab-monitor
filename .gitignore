@@ -155,4 +155,7 @@ Thumbs.db
 .idea/
 
 trash/
-
+nginx.conf
+deploy.sh
+QUICK_START.md
+CURRENT_DEPLOYMENT.md

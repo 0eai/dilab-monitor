@@ -1,7 +1,7 @@
 {
-  "name": "dilab-monitor-backend",
+  "name": "node-monitor-backend",
   "version": "1.0.0",
-  "description": "DILab Server Management & Monitoring Backend",
+  "description": "Multi-Node Server Management & Monitoring Backend",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
